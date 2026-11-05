@@ -1,0 +1,231 @@
+# utils.py
+import os
+import sys
+sys.path.append('/workdir1.8t/fei27/CGT/GNNMD/BACH/updated_X-MVLP')
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import transforms
+import numpy as np
+from PIL import Image
+
+import pickle
+import cv2
+import torchstain
+
+# Global stain normalizer
+_NORMALIZER = None
+_NORMALIZER_READY = False
+# utils.py
+def get_dataset_labels(dataset):
+    """
+    Safely get all labels from various dataset types.
+    Supports: ImageFolder, Subset, XMLVPDataset (custom), etc.
+    """
+    if isinstance(dataset, torch.utils.data.Subset):
+        return get_dataset_labels(dataset.dataset)
+
+    if hasattr(dataset, 'targets'):
+        # Common for MNIST, CIFAR, or datasets defining targets list
+        return [dataset.targets[i] for i in range(len(dataset))]
+
+    elif hasattr(dataset, 'samples'):
+        # ImageFolder and similar
+        return [sample[1] for sample in dataset.samples]
+
+    elif hasattr(dataset, 'df') and 'label' in dataset.df.columns:
+        # Assume it's a DataFrame-based dataset with 'label' column
+        return dataset.df['label'].tolist()
+
+    elif hasattr(dataset, 'data') and hasattr(dataset, 'labels'):
+        # Some custom formats
+        return dataset.labels
+
+    elif hasattr(dataset, '__getitem__'):
+        # Fallback: iterate through dataset
+        print("⚠️ No direct label access found. Iterating via __getitem__...")
+        labels = []
+        for i in range(len(dataset)):
+            _, y, *_ = dataset[i]  # Unpack: x, y, ...
+            labels.append(y)
+        return labels
+
+    else:
+        raise AttributeError(f"Cannot extract labels from dataset {type(dataset)}")
+def get_trainable_params(module):
+    """Returns a list of trainable parameters from a PyTorch module."""
+    return [p for p in module.parameters() if p.requires_grad]
+def forward_vision_features(visual, x: torch.Tensor):
+        """
+        Manual forward through open_clip's VisionTransformer to get patch features.
+        Returns: patch features [B, L, D] before final pooling
+        """
+        # (1) Patch embedding
+        x = visual.conv1(x)  # shape = [B, D, grid, grid]
+        grid_size = x.shape[-1]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, D, L]
+        x = x.permute(0, 2, 1)  # [B, L, D]
+
+        # (2) Add class token and positional embedding
+        x = torch.cat([visual.class_embedding.to(x.dtype).expand(x.shape[0], 1, -1), x], dim=1)
+        x = x + visual.positional_embedding.to(x.dtype)
+        x = visual.ln_pre(x)
+
+        # (3) Transformer forward (we need intermediate activations)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        for r in visual.transformer.resblocks:
+            x = r(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = visual.ln_post(x)
+
+        return x  # [B, L+1, D]
+def _fit_normalizer_from_reference_numpy(reference_path: str):
+    global _NORMALIZER, _NORMALIZER_READY
+    if not os.path.exists(reference_path):
+        return
+    ref_bgr = cv2.imread(reference_path)
+    ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
+    _NORMALIZER = torchstain.normalizers.MacenkoNormalizer(backend="numpy")
+    _NORMALIZER.fit(ref_rgb)
+    _NORMALIZER_READY = True
+# model.py or utils.py
+def load_local_biomedclip(MODEL_DIR, device="cuda"):
+  
+    import open_clip
+    
+
+    print(f"Loading BioMedCLIP from: {MODEL_DIR}")
+
+    # Step 1: Create standard ViT-B-16 CLIP model (matches BioMedCLIP's vision encoder)
+    model = open_clip.create_model("ViT-B-16", pretrained=None)
+    
+    # Step 2: Define paths
+    config_path = os.path.join(MODEL_DIR, "open_clip_config.json")
+    weights_path = os.path.join(MODEL_DIR, "open_clip_pytorch_model.bin")
+    
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Weights not found at: {weights_path}")
+
+    # Step 3: Load state dict
+    state_dict = torch.load(weights_path, map_location="cpu")
+    
+    # Handle key prefixes: remove 'module.' or 'model.' if present
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        k = k.replace("module.", "").replace("model.", "")
+        new_state_dict[k] = v
+
+    # Step 4: Load into model
+    result = model.load_state_dict(new_state_dict, strict=False)
+    print("Missing keys:", result.missing_keys)
+    print("Unexpected keys:", result.unexpected_keys)
+
+    # Step 5: Set up transforms
+    preprocess = open_clip.image_transform(
+        image_size=224,
+        is_train=False,
+        mean=(0.48145466, 0.4578275, 0.40821073),
+        std=(0.26862954, 0.26130258, 0.27577711)
+    )
+    
+    tokenizer = open_clip.get_tokenizer("ViT-B-16")
+
+    # Step 6: Move to device
+    model = model.to(device).eval()
+    return model, preprocess, 224
+
+def load_normalizer_pickle(pkl_path: str):
+    global _NORMALIZER, _NORMALIZER_READY
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            _NORMALIZER = pickle.load(f)
+        _NORMALIZER_READY = True
+
+
+def save_normalizer_pickle(pkl_path: str):
+    if _NORMALIZER_READY and _NORMALIZER is not None:
+        os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
+        with open(pkl_path, "wb") as f:
+            pickle.dump(_NORMALIZER, f)
+
+
+def stain_normalize(img: Image.Image) -> Image.Image:
+    if not (_NORMALIZER_READY and _NORMALIZER is not None):
+        return img
+    arr = np.array(img)
+    try:
+        norm = _NORMALIZER.normalize(arr)
+        return Image.fromarray(np.clip(norm, 0, 255).astype(np.uint8))
+    except:
+        return img
+
+
+_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+
+
+# Always define get_transform, even if stain norm is not available
+def get_transform(
+    img_size=224,
+    use_stain_norm=False,
+    reference_path=None,
+    normalizer_params=None,
+    stats="clip",
+    augment=False
+):
+    import torchvision.transforms as T
+    from PIL import Image
+    import numpy as np
+
+    tfms = []
+
+    # 1. Resize
+    tfms.append(T.Resize((img_size, img_size), interpolation=T.InterpolationMode.BILINEAR))
+
+    # 2. Stain normalization (PIL input)
+    if use_stain_norm:
+        global _NORMALIZER_READY
+        if _NORMALIZER_READY:
+            tfms.append(T.Lambda(stain_normalize))
+        else:
+            print("⚠️ Stain normalization requested but not ready; skipping.")
+
+    # 3. Convert to tensor BEFORE any color jitter
+    tfms.append(T.ToTensor())
+
+    if augment:
+        tfms.extend([
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomRotation(degrees=15, fill=0),
+            # ✅ Color jitter WITHOUT hue
+            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            # No hue!
+            T.RandomResizedCrop(
+                img_size,
+                scale=(0.9, 1.0),
+                ratio=(0.95, 1.05),
+                interpolation=T.InterpolationMode.BILINEAR,
+                antialias=True
+            ),
+        ])
+    else:
+        tfms.append(T.CenterCrop(img_size))
+
+    # 4. Normalize
+    if stats == "clip":
+        mean = [0.48145466, 0.4578275, 0.40821073]
+        std = [0.26862954, 0.26130258, 0.27577711]
+    elif stats == "imagenet":
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+    else:
+        raise ValueError(f"Unknown stats: {stats}")
+
+    tfms.append(T.Normalize(mean=mean, std=std))
+
+    return T.Compose(tfms)
+
+def _l2norm(x, dim=-1, eps=1e-12):
+    return x / (x.norm(dim=dim, keepdim=True) + eps)
