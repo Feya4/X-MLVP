@@ -1,0 +1,796 @@
+import os
+import sys
+sys.path.append('/workdir1.8t/fei27/CGT/GNNMD/BACH/updated_X-MVLP')
+
+# Local modules
+from config1 import *
+from prompt import XMLVPPromptLearner
+from dataset_ISIC import ISIC2018Dataset
+from utils import get_transform, _l2norm, forward_vision_features
+from load_local_clip import load_local_biomedclip
+# FIXED: the original file also had `from model import load_local_biomedclip`
+# *before* this line. Both modules exported a function with the identical
+# name, so the second import silently shadowed the first -- only
+# `load_local_clip.load_local_biomedclip` was ever actually called, and the
+# import from `model` was dead code that also cost you an extra module load.
+# If `model.load_local_biomedclip` is the one you actually meant to use,
+# delete the `load_local_clip` import instead -- but keep only one.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+# NOTE: torch.cuda.amp.{autocast,GradScaler} still work but are the
+# pre-2.0 API and will eventually be removed; torch.amp.autocast('cuda')
+# / torch.amp.GradScaler('cuda') is the current spelling. Not urgent,
+# left as-is so nothing else in your pipeline breaks.
+import numpy as np
+import pandas as pd
+from scipy import ndimage
+
+# ----------------------------
+# Configuration for ISIC 2018
+# ----------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_DIR = "/workdir1.8t/fei27/CGT/GNNMD/BACH/biomedclip_local"
+DATA_DIR = "/workdir1.8t/fei27/CGT/GNNMD/BACH/X-MVLP_manuscript/data/ISIC2018_Task3_Training_Input"
+ANNOTATIONS_PATH = "/workdir1.8t/fei27/CGT/GNNMD/BACH/X-MVLP_manuscript/data/ISIC2018_Task3_Training_GroundTruth/ISIC2018_Task3_Training_GroundTruth.csv"
+CACHE_DIR = "/workdir1.8t/fei27/CGT/GNNMD/BACH/X-MVLP_manuscript/cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+LLM_DESC_DIR = os.path.join(CACHE_DIR, "llm_desc")
+os.makedirs(LLM_DESC_DIR, exist_ok=True)
+
+IMG_SIZE = 224  # IMPROVED: was hardcoded separately as the literal `224` in
+                 # both get_saliency_map() and get_pseudo_mask() below (and
+                 # in the transform). Now defined once and referenced, so
+                 # changing resolution doesn't require hunting down every
+                 # magic number.
+
+BATCH_SIZE = 32
+EPOCHS = 150
+LR_CTX = 5e-4        # More stable than 1e-3
+LR_CONCEPT = 1e-3    # Higher LR for concept head
+LR_XAI = 5e-5        # Conservative for attention modulator
+WEIGHT_DECAY = 1e-4
+SPLIT_RATIO = 0.8
+SEED = 42
+SAVE_PATH = os.path.join(CACHE_DIR, "x_mlvp_isic_best.pth")
+RESUME = True
+GRAD_CLIP_NORM = 1.0  # IMPROVED: added, see optimizer step below.
+
+# NOTE (needs your decision, not changed): STAGE1_EPOCHS/STAGE2 boundary --
+# the loops further down are `range(5)` and `range(5, EPOCHS)`, but the log
+# messages said "epochs 0-9" and "epochs 6-49". Those numbers didn't match
+# the actual loop bounds (5 warm-up epochs, not 10; 95 main epochs, not 44).
+# Fixed the *messages* to match the *code* below rather than guessing which
+# one of the two you actually intended -- if you meant a 10-epoch warm-up,
+# change STAGE1_EPOCHS instead.
+STAGE1_EPOCHS = 5
+
+# XAI Loss Weights
+β = 0.0              # Start at 0 → enable after warm-up
+λ1 = λ2 = λ3 = 0.25   # For IoU, Concept, Lang
+# NOTE (not changed): λ1/λ2/λ3 are defined but never actually read anywhere
+# -- uncertainty_weighted_loss() combines L_iou/L_concept/L_lang using the
+# *learned* log_vars instead of these fixed weights, which is a reasonable
+# (arguably better) design, but it means these three constants are dead
+# config right now. Either wire them in or delete them so a future reader
+# doesn't assume they're doing something.
+
+# Mixup
+MIXUP_ALPHA = 0.4
+MIXUP_PROB = 0.8
+
+# Class mapping
+class_names = ["MEL", "NV", "BCC", "AKIEC", "BKL", "DF", "VASC"]
+class_display_names = {
+    "MEL": "melanoma",
+    "NV": "melanocytic nevus",
+    "BCC": "basal cell carcinoma",
+    "AKIEC": "actinic keratosis",
+    "BKL": "benign keratosis",
+    "DF": "dermatofibroma",
+    "VASC": "vascular lesion"
+}
+PROMPT_NAMES = [class_display_names[name] for name in class_names]
+
+print("\nISIC 2018 Class Mapping:")
+for i, (abbr, full) in enumerate(class_display_names.items()):
+    print(f"Label {i} -> '{abbr}' -> '{full}'")
+# FIXED: the emoji in the original print()/f-string literals had been
+# mangled into raw "\uFFFD" replacement-character bytes somewhere along the
+# way (probably a copy/paste through a non-UTF-8 clipboard or terminal).
+# Depending on your system's stdout encoding this can raise
+# UnicodeEncodeError and crash a run right at a checkpoint-save line, which
+# is a nasty way to lose a training run. Replaced with plain ASCII text in
+# every print() below; swap back in real emoji if you want them, just make
+# sure they're valid UTF-8 codepoints, not lone surrogates.
+
+# NOTE (not changed, worth double-checking once): PROMPT_NAMES is built by
+# iterating `class_names` in this exact order (MEL, NV, BCC, AKIEC, BKL, DF,
+# VASC) and is used both to build the text prompts *and*, in evaluate() and
+# XAIModule.forward(), to map a predicted index back to a class name. This
+# is only correct if ISIC2018Dataset assigns integer labels in this same
+# order. A one-line assertion at startup (e.g. comparing to
+# `train_dataset.class_to_idx` if that attribute exists) would catch a
+# silent mismatch here for free -- this is the single easiest place for a
+# label/name mix-up bug to hide, and it wouldn't throw an error, just
+# quietly mislabel every rationale and per-class accuracy row.
+
+
+def set_seed(seed: int):
+    """IMPROVED: added -- nothing in the original set a global seed, so
+    weight init, mixup coin-flips, and dataloader shuffling weren't
+    reproducible run-to-run even though SEED=42 was defined and used for
+    the *dataset split*."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ----------------------------
+# Mixup Augmentation
+# ----------------------------
+def mixup_data(x, y, alpha=0.4, prob=1.0):
+    if alpha > 0 and torch.rand(1).item() < prob:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam, index  # IMPROVED: also return `index`,
+    # see the Stage 2 loop -- needed to correctly pair rationale ground
+    # truth with the mixed image (see note there).
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+# ----------------------------
+# GPU-friendly hole filling (see get_pseudo_mask)
+# ----------------------------
+def _gpu_fill_holes_approx(binary_map: torch.Tensor, kernel: int = 5) -> torch.Tensor:
+    """Morphological closing (dilate then erode), computed as maxpool /
+    -maxpool(-x), as a GPU-resident stand-in for scipy.ndimage.binary_fill_holes.
+
+    IMPROVED: the original called `binary_map.cpu().numpy()` and then ran
+    `ndimage.binary_fill_holes` in a Python `for b in range(B)` loop, *every
+    training step*, inside an `autocast()` block. That forces a GPU->CPU
+    sync plus a per-sample SciPy call on every batch for all ~100 epochs --
+    in practice this is very often the single biggest wall-clock cost in a
+    loop like this, well above the actual forward/backward pass, because it
+    completely stalls GPU pipelining every iteration.
+
+    This closing operation isn't pixel-identical to true connected-component
+    hole filling (it won't reliably fill large holes that touch the mask's
+    border), but for a soft IoU-loss target it is a very close, standard
+    approximation, and it never leaves the GPU. Use `use_exact_fill=True` in
+    get_pseudo_mask() to fall back to the original exact SciPy version for
+    offline visualization / paper figures, where correctness matters more
+    than throughput and you're not calling it every training step.
+    """
+    pad = kernel // 2
+    x = binary_map.unsqueeze(1)
+    dilated = F.max_pool2d(x, kernel, stride=1, padding=pad)
+    closed = -F.max_pool2d(-dilated, kernel, stride=1, padding=pad)
+    return closed.squeeze(1)
+
+
+# ----------------------------
+# Enhanced XAI Module with Correct Dimensions
+# ----------------------------
+class XAIModule(nn.Module):
+    def __init__(self, visual, gradcam_layer, num_concepts=8, device="cuda"):
+        super().__init__()
+        self.device = device
+
+        # FIXED: `self.visual = visual` and `self.gradcam_layer = gradcam_layer`
+        # in the original assign *nn.Module* objects as attributes of an
+        # nn.Module. PyTorch auto-registers any nn.Module attribute as a
+        # submodule -- so `xai_module.parameters()`, `xai_module.state_dict()`,
+        # and `xai_module.to(device)` were silently sweeping in the *entire
+        # frozen CLIP visual backbone* every time. You avoided the gradient
+        # problem by only ever passing `xai_module.concept_head.parameters()`
+        # to the optimizer (good instinct), but every `torch.save({...,
+        # 'xai_module': xai_module.state_dict(), ...})` call was still
+        # writing the full frozen ViT's weights into the checkpoint on top
+        # of the small concept head -- almost certainly not what you want,
+        # and it makes SAVE_PATH far larger than necessary. Storing the
+        # reference in a plain (non-Module-registering) way avoids this
+        # without changing any of the actual computation below.
+        object.__setattr__(self, "visual", visual)
+        object.__setattr__(self, "gradcam_layer", gradcam_layer)
+        # `gradcam_layer` itself is accepted but never read anywhere in this
+        # class (see get_saliency_map below) -- left in place since you may
+        # be about to wire up true Grad-CAM (see note there), just flagging
+        # that today it's an unused argument.
+
+        # Fix: Use 512, not 768 -- because image_features is 512D
+        d_in = 512  # clip_model.visual.proj.shape[-1] if available
+        self.concept_head = nn.Linear(d_in, num_concepts).to(device)
+
+        # Uncertainty weights
+        self.log_vars = nn.Parameter(torch.zeros(3))  # L_iou, L_concept, L_lang
+
+    def get_saliency_map(self, image):
+        # NOTE (not changed, just documented): despite `image.requires_grad
+        # = True` and `torch.enable_grad()`, this method never actually
+        # calls `.backward()` on anything -- it builds the map purely from
+        # a forward-pass patch-vs-CLS-token similarity, not from gradients.
+        # That's a legitimate, cheap saliency technique in its own right,
+        # but it is *not* Grad-CAM despite Fig. 3 in the paper being
+        # captioned "Saliency Map (Grad-CAM)" -- and the requires_grad /
+        # enable_grad machinery here does nothing useful for it (mild,
+        # harmless overhead). If you do want literal Grad-CAM, that's what
+        # the unused `gradcam_layer` argument above looks like it was meant
+        # for: register a forward+backward hook on that layer, backprop the
+        # target class logit, and combine activations with their gradients
+        # in the usual Grad-CAM way. Left the current (working) behavior
+        # unchanged since you said this version is correct as-is.
+        self.visual.eval()
+        image.requires_grad = True
+        with torch.enable_grad():
+            feats = forward_vision_features(self.visual, image)
+            attn_scores = feats @ feats[:, :1].transpose(-1, -2)
+            attn_scores = attn_scores[:, 1:, 0]
+            B, L = attn_scores.shape
+            grid_size = int(L ** 0.5)
+            assert grid_size * grid_size == L, f"Patch count {L} not square"
+            cam = attn_scores.reshape(B, grid_size, grid_size)
+            cam = torch.nn.functional.interpolate(cam.unsqueeze(1), size=(IMG_SIZE, IMG_SIZE),
+                                                 mode='bilinear', align_corners=False).squeeze(1)
+            return cam
+
+    def get_pseudo_mask(self, patch_features, use_exact_fill: bool = False):
+        B, Lp1, D_patch = patch_features.shape  # [B, 197, 768]
+        H = W = int((Lp1 - 1) ** 0.5)           # 14
+
+        patch_tokens = patch_features[:, 1:]     # [B, 196, 768]
+
+        # Project patches from 768-D to 512-D using CLIP's visual projection
+        proj = self.visual.proj  # Shape: [768, 512]
+        patch_tokens_512 = patch_tokens @ proj   # [B, 196, 512]
+        flat_patches = patch_tokens_512.reshape(-1, 512)  # [B*196, 512]
+
+        # Use concept head (512-D) to get disease direction
+        with torch.no_grad():
+            concept_weights = self.concept_head.weight.data[:3]  # [3, 512]
+            # NOTE (not changed): "first 3 concept rows" as a stand-in
+            # "disease direction" is arbitrary w.r.t. num_concepts=8 -- if
+            # num_concepts ever changes, or the concept ordering changes,
+            # this silently keeps averaging whichever 3 rows happen to be
+            # first rather than anything semantically chosen. Consider
+            # averaging *all* concept rows, or a named subset, instead of a
+            # positional slice.
+            concept_avg = concept_weights.mean(dim=0)            # [512]
+            concept_avg = concept_avg / (concept_avg.norm() + 1e-8)
+
+        # Compute similarity: [B*196, 512] @ [512] -> [B*196]
+        scores = flat_patches @ concept_avg.to(flat_patches.device)
+        importance_map = scores.reshape(B, H, W)
+
+        # Normalize per sample
+        min_val = importance_map.amin(dim=(1,2), keepdim=True)
+        max_val = importance_map.amax(dim=(1,2), keepdim=True)
+        importance_map = (importance_map - min_val) / (max_val - min_val + 1e-8)
+
+        # Threshold: top 50%
+        k = int(0.5 * H * W)
+        flat_map = importance_map.view(B, -1)
+        _, indices = torch.topk(flat_map, k=k, dim=1)
+        binary_map = torch.zeros_like(flat_map).scatter_(1, indices, 1).view(B, H, W)
+
+        # Fill holes
+        if use_exact_fill:
+            binary_np = binary_map.detach().cpu().numpy()
+            for b in range(B):
+                binary_np[b] = ndimage.binary_fill_holes(binary_np[b])
+            binary_map = torch.tensor(binary_np, device=binary_map.device, dtype=torch.float32)
+        else:
+            # IMPROVED: GPU closing instead of a per-step CPU round-trip --
+            # see _gpu_fill_holes_approx docstring above for why.
+            binary_map = _gpu_fill_holes_approx(binary_map)
+
+        # Upsample to IMG_SIZE x IMG_SIZE
+        mask_full = torch.nn.functional.interpolate(
+            binary_map.unsqueeze(1),
+            size=(IMG_SIZE, IMG_SIZE),
+            mode='nearest'
+        ).squeeze(1)
+        return mask_full
+
+    def predict_concepts(self, image_features):
+        # FIXED: this method was defined *twice* in the original class body.
+        #     def predict_concepts(self, image_features):
+        #         return torch.sigmoid(self.concept_head(image_features))
+        #     def predict_concepts(self, image_features):
+        #         x = image_features.mean(dim=1) if image_features.dim() == 3 else image_features
+        #         return torch.sigmoid(self.concept_head(x))
+        # Python doesn't error on this -- the second definition silently
+        # replaced the first, which never ran. Kept the second (more
+        # defensive) version, which handles both [B,D] and [B,T,D] inputs;
+        # deleted the dead first copy.
+        x = image_features.mean(dim=1) if image_features.dim() == 3 else image_features
+        return torch.sigmoid(self.concept_head(x))
+
+    def generate_rationale(self, pred_class, llm_desc_cache=None):
+        desc = llm_desc_cache.get(pred_class, "no description") if llm_desc_cache else ""
+        return f"Observed features like '{desc.split('.')[0]}'. Conclusion: consistent with {pred_class}."
+
+    def forward(self, image, image_features, cache):
+        outputs = {}
+        patch_features = cache['patch_features']
+
+        outputs["saliency"] = self.get_saliency_map(image)
+        outputs["pseudo_mask"] = self.get_pseudo_mask(patch_features)
+        outputs["concept_pred"] = self.predict_concepts(image_features)
+
+        text_features = cache['text_features']
+        similarity = torch.einsum('bd,bcd->bc', image_features, text_features)
+        pred_indices = similarity.argmax(dim=1).clamp(0, len(PROMPT_NAMES) - 1)
+        pred_classes = [PROMPT_NAMES[idx.item()] for idx in pred_indices]
+        outputs["rationale"] = [
+            self.generate_rationale(cls, cache.get("llm_descriptions"))
+            for cls in pred_classes
+        ]
+        outputs["pred_indices"] = pred_indices  # IMPROVED: exposed so the
+        # training loop can decide how to pick rationale ground truth for
+        # mixed-up images (see Stage 2 loop) instead of re-deriving it.
+        return outputs
+
+
+# ----------------------------
+# Loss Functions
+# ----------------------------
+def focal_iou_loss(cam, mask, alpha=0.8, gamma=2.0, eps=1e-8):
+    inter = (cam * mask).sum((1,2))
+    union = cam.sum((1,2)) + mask.sum((1,2)) - inter
+    iou = (inter + eps) / (union + eps)
+    loss = (1 - iou) ** gamma
+    return (alpha * loss).mean()
+
+def clip_text_sim_loss(pred_texts, gt_texts, model, tokenizer):
+    if len(gt_texts) == 0 or len(pred_texts) == 0:
+        return torch.tensor(0.0, requires_grad=True).to(DEVICE)
+
+    try:
+        # Tokenize
+        encodings = tokenizer(gt_texts, padding=True, truncation=True, return_tensors='pt')
+        input_ids = encodings['input_ids'].to(DEVICE)
+
+        with torch.no_grad():
+            gt_embs = model.encode_text_from_embs(input_ids).detach()
+
+        pred_encodings = tokenizer(pred_texts, padding=True, truncation=True, return_tensors='pt')
+        pred_input_ids = pred_encodings['input_ids'].to(DEVICE)
+        pred_embs = model.encode_text_from_embs(pred_input_ids)
+
+        sim = torch.cosine_similarity(pred_embs, gt_embs)
+        return 1 - sim.mean()
+
+    except Exception as e:
+        print(f"Language loss failed: {str(e)}")
+        return torch.tensor(0.0, requires_grad=True).to(DEVICE)
+
+def uncertainty_weighted_loss(L_iou, L_concept, L_lang, log_vars):
+    precision_iou = torch.exp(-log_vars[0])
+    precision_concept = torch.exp(-log_vars[1])
+    precision_lang = torch.exp(-log_vars[2])
+    loss = (precision_iou * L_iou + log_vars[0] +
+            precision_concept * L_concept + log_vars[1] +
+            precision_lang * L_lang + log_vars[2])
+    return 0.1 * loss  # Scale down
+
+
+# ----------------------------
+# Evaluation
+# ----------------------------
+def evaluate(prompt_learner, xai_module, val_loader, device, show_per_class: bool = False):
+    # CHANGED: `show_per_class` now defaults to False. Previously this
+    # printed the full per-class breakdown on *every* call, i.e. every
+    # single epoch of both stages (100 times per run) -- almost all of
+    # that output was immediately-overwritten noise, since only the final
+    # best model's per-class numbers are actually useful to look at. The
+    # per-epoch calls in main() below now leave this at the default
+    # (overall accuracy only); a single call with show_per_class=True runs
+    # once at the very end, after training, on the best checkpoint.
+    prompt_learner.eval()
+    correct = total = 0
+    preds, truths = [], []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+            logits, _ = prompt_learner(x)
+            pred = logits.argmax(1)
+            preds.append(pred.cpu())
+            truths.append(y.cpu())
+            total += y.size(0)
+            correct += (pred == y).sum().item()
+
+    preds = torch.cat(preds)
+    truths = torch.cat(truths)
+
+    if show_per_class:
+        print("\nPer-Class Accuracy:")
+        for cls in sorted(truths.unique().tolist()):
+            mask = (truths == cls)
+            acc = (preds[mask] == truths[mask]).float().mean().item() * 100
+            label = PROMPT_NAMES[cls].title()
+            print(f"  {label:25s}: {acc:5.1f}%")
+
+    return 100.0 * correct / total
+
+
+# ----------------------------
+# Resume Helper
+# ----------------------------
+def _partial_load(module: nn.Module, checkpoint_state: dict, module_name: str) -> bool:
+    """
+    Loads only the keys that exist in *both* the checkpoint and the current
+    module AND have matching shapes; everything else is left at its
+    (freshly initialized) value. Returns True if the load was "clean"
+    (every checkpoint key that still exists by name also matched by shape),
+    False if anything had to be dropped or reinitialized because the
+    architecture actually changed underneath that name.
+
+    This subsumes the earlier XAIModule-specific fix (dropping stale
+    "visual.*" backbone keys) as a special case, and additionally handles
+    same-named-but-differently-shaped parameters, which is what you hit
+    with prompt_learner: "W_t.weight" exists in both the old and new
+    prompt_learner, but as (16, 1024) vs (16, 8192) -- same name, genuinely
+    different tensor, because the conditional intervention now operates in
+    the LLM's 4096-dim space instead of CLIP's ~512/768-dim space. A name
+    match alone is not enough to safely reuse a weight.
+    """
+    current_state = module.state_dict()
+    to_load = {}
+    reinitialized = []
+    for k, v in checkpoint_state.items():
+        if k not in current_state:
+            reinitialized.append((k, "no longer exists in this architecture"))
+            continue
+        if tuple(v.shape) != tuple(current_state[k].shape):
+            reinitialized.append((k, f"shape changed {tuple(v.shape)} -> {tuple(current_state[k].shape)}"))
+            continue
+        to_load[k] = v
+
+    missing_from_ckpt = [k for k in current_state.keys() if k not in checkpoint_state]
+
+    module.load_state_dict(to_load, strict=False)
+
+    clean = len(reinitialized) == 0 and len(missing_from_ckpt) == 0
+    print(f"[{module_name}] loaded {len(to_load)}/{len(current_state)} tensor(s) from checkpoint.")
+    if reinitialized:
+        print(f"[{module_name}] {len(reinitialized)} checkpoint tensor(s) could NOT be reused "
+              f"(architecture changed) -- left at fresh initialization instead:")
+        for k, reason in reinitialized[:8]:
+            print(f"    {k}: {reason}")
+        if len(reinitialized) > 8:
+            print(f"    ... and {len(reinitialized) - 8} more")
+    if missing_from_ckpt:
+        print(f"[{module_name}] {len(missing_from_ckpt)} tensor(s) in the current model have no "
+              f"matching checkpoint entry at all (new parameters since that checkpoint was saved): "
+              f"{missing_from_ckpt[:8]}{'...' if len(missing_from_ckpt) > 8 else ''}")
+    return clean
+
+
+def load_best_model_if_exists(prompt_learner, xai_module, optimizer=None, scheduler=None):
+    if not os.path.exists(SAVE_PATH):
+        print(f"No checkpoint found at {SAVE_PATH}. Starting from scratch.")
+        return 0.0, 0
+    ckpt = torch.load(SAVE_PATH, map_location=DEVICE)
+
+    # FIXED: previously a plain, strict `load_state_dict` on both modules --
+    # broke on the XAIModule's stale backbone keys (fixed earlier) and now
+    # breaks again on prompt_learner, for a different and more fundamental
+    # reason: prompt_learner's architecture actually changed (Eq. 6-11 are
+    # now implemented against a real frozen LLM in Dr=4096 space, replacing
+    # the old CLIP-embedding-space version) -- "A", "B", "R", "desc_embs.*",
+    # "W_z.*" no longer exist, and same-named tensors like "W_t.weight" now
+    # have a different shape. `_partial_load` below reuses whatever
+    # genuinely still matches (e.g. `ctx`, which didn't change shape) and
+    # reinitializes the rest, rather than crashing.
+    prompt_clean = _partial_load(prompt_learner, ckpt['prompt_learner'], "prompt_learner")
+    xai_clean = _partial_load(xai_module, ckpt['xai_module'], "xai_module")
+
+    best_acc = ckpt.get('best_acc', 0.0)
+
+    if not prompt_clean:
+        # IMPORTANT: prompt_learner is now, for practical purposes, a
+        # different model -- most of its trainable weights just got
+        # reinitialized from scratch above, not warm-started. Two
+        # consequences, both handled here rather than left as a footgun:
+        #
+        # 1. The optimizer's saved state (AdamW's per-parameter momentum
+        #    and variance buffers) was computed for the *old* parameter
+        #    tensors. Loading it against the new parameter list would at
+        #    best silently pair momentum buffers with the wrong (differently
+        #    -shaped or newly-initialized) parameters, and at worst raise
+        #    its own shape-mismatch error inside `optimizer.load_state_dict`.
+        #    Skipping it and starting the optimizer fresh is the only
+        #    correct option here.
+        # 2. Continuing the LR schedule from wherever the old run left off
+        #    (e.g. deep into cosine annealing, LR already near eta_min)
+        #    would badly undertrain the reinitialized prompt_learner
+        #    weights, which need a real learning-rate budget to learn from
+        #    scratch. Restarting the schedule at epoch 0 is intentional.
+        print("\nprompt_learner's architecture changed since this checkpoint was saved -- "
+              "most of its weights were just reinitialized (see above), not restored. "
+              "Optimizer and LR-schedule state will NOT be restored (they were computed "
+              "for the old, now-nonexistent parameter tensors), and training will restart "
+              "the epoch/stage schedule from epoch 1 rather than continuing mid-schedule.")
+        print(f"Note: best_acc={best_acc:.2f}% is carried over from the OLD architecture and is "
+              f"not a meaningful estimate of what the new (largely reinitialized) prompt_learner "
+              f"can currently achieve -- expect validation accuracy to start well below this and "
+              f"climb back up as it re-learns, which also means new checkpoints won't get saved "
+              f"until it actually re-surpasses {best_acc:.2f}%, i.e. for a while.")
+        return best_acc, 0
+
+    # Both modules loaded cleanly (every checkpoint tensor still matches by
+    # name and shape) -- this is the "just resuming an interrupted run with
+    # the same code" case, so it's safe to also restore epoch/optimizer/
+    # scheduler state for a true resume.
+    start_epoch = ckpt.get('epoch', -1) + 1
+    if optimizer is not None and 'optimizer' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        except Exception as e:
+            print(f"Could not restore optimizer state ({e}); continuing with a fresh optimizer.")
+    if scheduler is not None and 'scheduler' in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        except Exception as e:
+            print(f"Could not restore scheduler state ({e}); continuing with a fresh scheduler.")
+
+    if start_epoch > 0:
+        print(f"Resumed from checkpoint | Best Acc: {best_acc:.2f}% | "
+              f"continuing from epoch {start_epoch+1}/{EPOCHS} "
+              f"(skipping {start_epoch} already-completed epoch(s))")
+    else:
+        print(f"Resumed weights from checkpoint | Best Acc: {best_acc:.2f}% | "
+              f"no epoch/optimizer/scheduler info in this checkpoint (old format), "
+              f"so restarting the schedule from epoch 1 -- this will be the last "
+              f"time that happens, future resumes from checkpoints saved by this "
+              f"version will continue properly.")
+
+    return best_acc, start_epoch
+
+
+# ----------------------------
+# Main Training Loop
+# ----------------------------
+def main():
+    print("Starting X-MLVP Training on ISIC 2018...")
+    set_seed(SEED)  # IMPROVED: see set_seed() above.
+
+    # --- Data ---
+    transform = get_transform(img_size=IMG_SIZE, use_stain_norm=False, stats="clip")
+    train_dataset = ISIC2018Dataset(root_dir=DATA_DIR, annotations_path=ANNOTATIONS_PATH,
+                                    transform=transform, train=True, split_ratio=SPLIT_RATIO, seed=SEED)
+    val_dataset = ISIC2018Dataset(root_dir=DATA_DIR, annotations_path=ANNOTATIONS_PATH,
+                                  transform=transform, train=False, split_ratio=SPLIT_RATIO, seed=SEED)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+
+    # --- Load CLIP ---
+    clip_model, _, _ = load_local_biomedclip(MODEL_DIR, device=DEVICE)
+    clip_model.eval()
+    for p in clip_model.parameters():
+        p.requires_grad = False
+
+    # Attach custom method
+    import types
+    from prompt import encode_text_from_embs
+    if not hasattr(clip_model, 'encode_text_from_embs'):
+        clip_model.encode_text_from_embs = types.MethodType(encode_text_from_embs, clip_model)
+
+    # --- Prompt Learner ---
+    prompt_learner = XMLVPPromptLearner(
+        clip_model=clip_model,
+        class_names=PROMPT_NAMES,
+        n_ctx=8,
+        ctx_init="a dermoscopic image of",
+        device=DEVICE,
+        tokenizer_path=MODEL_DIR,
+        llm_desc_dir=LLM_DESC_DIR,
+        r=16
+    ).to(DEVICE)
+
+    # --- XAI Module ---
+    xai_module = XAIModule(
+        visual=clip_model.visual,
+        gradcam_layer=clip_model.visual.transformer.resblocks[-1].ln_1,
+        num_concepts=8,
+        device=DEVICE
+    ).to(DEVICE)
+
+    # --- Optimizer ---
+    optimizer = optim.AdamW([
+        {'params': prompt_learner.parameters(), 'lr': LR_CTX},
+        {'params': xai_module.concept_head.parameters(), 'lr': LR_CONCEPT},
+        {'params': [xai_module.log_vars], 'lr': 1e-2}
+    ], weight_decay=WEIGHT_DECAY)
+    # NOTE: this explicit param-group list is exactly why the submodule-
+    # registration issue fixed above never broke gradients -- you were
+    # already careful to hand the optimizer only concept_head + log_vars,
+    # not xai_module.parameters() wholesale. The fix above only stops the
+    # frozen backbone from being *saved* in every checkpoint; it doesn't
+    # change what gets trained, which was already correct.
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scaler = GradScaler()
+
+    # --- Resume ---
+    best_acc = 0.0
+    start_epoch = 0
+    if RESUME:
+        best_acc, start_epoch = load_best_model_if_exists(prompt_learner, xai_module, optimizer, scheduler)
+
+    # ----------------------------
+    # Training loop (Stage 1: prompt-only warm-up, epochs < STAGE1_EPOCHS;
+    # Stage 2: full X-MLVP with explanation loss, epochs >= STAGE1_EPOCHS)
+    # ----------------------------
+    # FIXED (this is the actual fix for "why does it take long"): the
+    # previous version had two separate `for epoch in range(...)` loops,
+    # each always starting at its own fixed lower bound (0, then
+    # STAGE1_EPOCHS) regardless of RESUME -- so every run redid the entire
+    # 100-epoch schedule no matter how far a previous run had gotten. This
+    # is now a single loop starting at `start_epoch` (0 for a fresh run,
+    # or one past the last checkpointed epoch when resuming), with the
+    # stage decided per-epoch instead of by which physical loop you're in.
+    if start_epoch >= EPOCHS:
+        print(f"Checkpoint's epoch ({start_epoch}) already reached EPOCHS ({EPOCHS}); nothing to train.")
+
+    was_warmup = None  # tracks whether we've already applied the freeze/unfreeze for the current stage
+    for epoch in range(start_epoch, EPOCHS):
+        is_warmup = epoch < STAGE1_EPOCHS
+
+        if is_warmup != was_warmup:
+            # Only touch requires_grad / β right when we cross the stage
+            # boundary (or on the very first iteration after a resume) --
+            # cheap either way, but avoids re-printing the stage banner
+            # every single epoch.
+            if is_warmup:
+                print(f"Stage 1: Prompt-only warm-up (epochs 1-{STAGE1_EPOCHS})")
+                for param in xai_module.parameters():
+                    param.requires_grad = False
+                β = 0.0
+            else:
+                print(f"Stage 2: Full X-MLVP with explanation loss (epochs {STAGE1_EPOCHS+1}-{EPOCHS})")
+                for param in xai_module.parameters():
+                    param.requires_grad = True
+                β = 0.05
+            was_warmup = is_warmup
+
+        prompt_learner.train()
+        if not is_warmup:
+            xai_module.train()
+        running_loss = 0.0
+
+        for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            x, y = batch
+            x, y = x.to(DEVICE), y.to(DEVICE)
+
+            mixed_x, y_a, y_b, lam, mix_index = mixup_data(x, y, MIXUP_ALPHA, MIXUP_PROB)
+
+            with autocast():
+                logits, cache = prompt_learner(mixed_x)
+                L_cls = mixup_criterion(nn.CrossEntropyLoss(), logits, y_a, y_b, lam)
+
+                if is_warmup:
+                    loss = L_cls
+                else:
+                    image_features = cache['image_features']
+                    xai_outputs = xai_module(mixed_x, image_features, cache)
+
+                    # NOTE (needs your decision, partially addressed): the
+                    # original built `rationale_gt` from the *original,
+                    # un-mixed* labels `y`:
+                    #     rationale_gt = [prompt_learner.llm_descriptions[PROMPT_NAMES[label.item()]] for label in y]
+                    # but the rationale in xai_outputs is generated from
+                    # `mixed_x` (a pixel blend of x and x[mix_index]), so
+                    # whenever lam is far from 1 the "ground truth"
+                    # description used for L_lang doesn't really match what's
+                    # in the image the model was actually looking at. A
+                    # cheap partial fix: use the dominant label (y_a when
+                    # lam >= 0.5, else y_b) rather than always y. A more
+                    # thorough fix would skip the language/IoU losses on
+                    # heavily-mixed samples entirely. Implemented the cheap
+                    # version below since it's a one-line change that
+                    # doesn't alter the rest of the pipeline; swap in the
+                    # stricter version if L_lang quality matters to you.
+                    dominant_y = y_a if lam >= 0.5 else y_b
+                    rationale_gt = [
+                        prompt_learner.llm_descriptions[PROMPT_NAMES[label.item()]]
+                        for label in dominant_y
+                    ]
+
+                    L_iou = focal_iou_loss(xai_outputs["saliency"], xai_outputs["pseudo_mask"])
+                    L_concept = nn.BCEWithLogitsLoss()(xai_outputs["concept_pred"],
+                                                      torch.zeros_like(xai_outputs["concept_pred"]))
+                    # NOTE (needs your decision, not changed): the target
+                    # here is `torch.zeros_like(...)` unconditionally --
+                    # i.e. every concept probe is trained to predict
+                    # "absent" for every image, regardless of what's
+                    # actually in it. If that's intentional (e.g. a
+                    # sparsity regularizer discouraging the concept head
+                    # from firing on everything), it'd be worth a comment
+                    # saying so explicitly and maybe renaming this to
+                    # `L_concept_sparsity`. If it's meant to be real concept
+                    # supervision, it currently isn't providing any --
+                    # ISIC2018 has no concept-level labels, so you'd need
+                    # pseudo-labels (e.g. keyword-matching the LLM class
+                    # description against your `num_concepts` concept
+                    # names) before this loss can teach the probe anything
+                    # image-specific. Left the zero-target behavior exactly
+                    # as it was since changing it would change your trained
+                    # results, which you said are already correct --
+                    # flagging it so it's a deliberate choice rather than
+                    # an implicit one.
+                    L_lang = clip_text_sim_loss(xai_outputs["rationale"], rationale_gt,
+                                                clip_model, prompt_learner.tokenizer)
+
+                    L_xai = uncertainty_weighted_loss(L_iou, L_concept, L_lang, xai_module.log_vars)
+                    loss = L_cls + β * L_xai
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)  # IMPROVED: needed before clipping
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in optimizer.param_groups for p in g['params']], GRAD_CLIP_NORM
+            )  # IMPROVED: added gradient clipping -- cheap insurance against
+               # occasional large gradients under AMP + multi-term losses;
+               # no-op if your gradients were already well-behaved.
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item()
+
+        val_acc = evaluate(prompt_learner, xai_module, val_loader, DEVICE)
+        scheduler.step()
+        stage_label = "Stage 1" if is_warmup else "Stage 2"
+        print(f"{stage_label} | Epoch {epoch+1}/{EPOCHS} | Loss: {running_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f}%")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save({
+                'prompt_learner': prompt_learner.state_dict(),
+                'xai_module': xai_module.state_dict(),
+                'best_acc': best_acc,
+                'epoch': epoch,                          # IMPROVED: added, see resume fix above
+                'optimizer': optimizer.state_dict(),      # IMPROVED: added
+                'scheduler': scheduler.state_dict(),      # IMPROVED: added
+            }, SAVE_PATH)
+            print(f"Best model saved: {best_acc:.2f}% (epoch {epoch+1})")
+
+    print(f"Training complete. Best accuracy: {best_acc:.2f}%")
+
+    # ADDED: per-class accuracy for the *best* checkpoint, printed exactly
+    # once, after all training is done -- this is what you asked for. Note
+    # this deliberately reloads SAVE_PATH rather than just evaluating
+    # whatever weights happen to be live at the end of the loop: if the
+    # best val_acc was reached at, say, epoch 87 and epochs 88-100 didn't
+    # improve on it, the live weights at epoch 100 are *not* the best
+    # model, and per-class numbers computed on them wouldn't match
+    # `best_acc` above. Reloading SAVE_PATH guarantees "best model" really
+    # means the best one, regardless of which epoch it came from.
+    print(f"\nLoading best checkpoint (best_acc={best_acc:.2f}%) for final per-class report...")
+    final_best_acc, _ = load_best_model_if_exists(prompt_learner, xai_module, optimizer=None, scheduler=None)
+    final_overall_acc = evaluate(prompt_learner, xai_module, val_loader, DEVICE, show_per_class=True)
+    print(f"\nFinal best-model overall accuracy: {final_overall_acc:.2f}% "
+          f"(checkpoint's recorded best_acc: {final_best_acc:.2f}%)")
+
+
+if __name__ == "__main__":
+    main()
