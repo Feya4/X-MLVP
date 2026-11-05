@@ -1,0 +1,522 @@
+# prompt.py
+# prompt.py
+import os, sys
+sys.path.append("/workdir1.8t/fei27/CGT/GNNMD/BACH/updated_X-MVLP")
+
+import open_clip
+import torch
+import torch.nn as nn
+import math
+import os
+import pickle
+from transformers import AutoTokenizer
+from typing import Dict, List, Optional
+
+# FIXED: the original had both
+#     from utils import forward_vision_features
+# *and* a local `def forward_vision_features(...)` immediately below it.
+# The local def silently wins (a later `def` in the same module always
+# rebinds the name), so the import was dead code -- harmless here since
+# XMLVPPromptLearner.forward() only ever calls the local version, but it's
+# confusing to read and easy to "fix" by deleting the wrong one later.
+# Removed the redundant import; kept the local definition unchanged since
+# nothing was reported wrong with it.
+
+
+def forward_vision_features(visual, x: torch.Tensor):
+    """
+    Forward pass through CLIP's vision transformer to get raw patch features (before proj).
+    Returns: [B, L+1, D_vision] where D_vision = 768 for ViT-B/16
+    """
+    x = visual.conv1(x)  # [B, 768, grid, grid]
+    grid_size = x.shape[-1]
+    x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, 768, 196]
+    x = x.permute(0, 2, 1)  # [B, 196, 768]
+
+    # Add CLS token
+    cls_token = visual.class_embedding.to(x.dtype).expand(x.shape[0], 1, -1)  # [B, 1, 768]
+    x = torch.cat([cls_token, x], dim=1)  # [B, 197, 768]
+
+    # Add positional embedding
+    x = x + visual.positional_embedding.to(x.dtype)
+
+    # Pre-LN
+    x = visual.ln_pre(x)
+
+    # Transformer blocks
+    x = x.permute(1, 0, 2)
+    for r in visual.transformer.resblocks:
+        x = r(x)
+    x = x.permute(1, 0, 2)  # [B, 197, 768]
+
+    # Final layer norm — but DO NOT apply visual.proj
+    x = visual.ln_post(x)  # [B, 197, 768] — still 768D
+
+    # Do NOT do: x = x @ visual.proj — that reduces to 512D
+
+    return x  # [B, 197, 768]
+
+
+class LoRALinear(nn.Module):
+    """LoRA adapter for linear layers. Wraps an existing (frozen) dense
+    layer with a trainable low-rank delta -- appropriate when adapting a
+    real pretrained layer. NOTE: no longer used by the conditional
+    intervention module below (see W_z fix in XMLVPPromptLearner) since
+    Eq. 9 defines W_z as *purely* low-rank (Q_z K_z), with no pretrained
+    dense layer underneath to adapt. Left here in case you use it
+    elsewhere."""
+    def __init__(self, base_linear: nn.Linear, r=4, alpha=1.0, dropout=0.0):
+        super().__init__()
+        self.base = base_linear
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.A = nn.Parameter(torch.zeros(base_linear.out_features, r))
+        self.B = nn.Parameter(torch.zeros(r, base_linear.in_features))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        nn.init.zeros_(self.B)
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        base_out = self.base(x)
+        lora_out = self.dropout(x) @ self.B.t() @ self.A.t()
+        return base_out + self.scaling * lora_out
+
+
+def _l2norm(x, dim=-1, eps=1e-12):
+    return x / (x.norm(dim=dim, keepdim=True) + eps)
+
+
+def load_llm_class_descriptions(
+    class_names: List[str],
+    desc_cache_dir: str = "./cache/llm_desc"
+) -> Dict[str, str]:
+    """Load pre-generated LLM descriptions for each class."""
+    descriptions = {}
+    for name in class_names:
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        path = os.path.join(desc_cache_dir, f"{safe_name}.txt")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                descriptions[name] = f.read().strip()
+        else:
+            descriptions[name] = f"a histopathology image of {name}"
+    return descriptions
+
+
+class LLMKnowledgeEncoder:
+    """
+    ADDED: this is the piece that was entirely missing before. Loads a
+    frozen causal LM (e.g. LLaMA-3-8B, matching the paper's Sec. V) once,
+    and for each class description extracts the [EOS]-token hidden state
+    from *every transformer layer* (paper Eq. 6: r_y^l for l=1..Lr).
+    Always run under torch.no_grad(); never appears in the optimizer.
+    Results are cached to disk per class so the LLM only ever runs once,
+    matching the paper's "pre-computed in inference mode" design
+    (Sec. III-C.2).
+    """
+
+    def __init__(self, model_path: str, device: str = "cuda", dtype=torch.float16):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        from transformers import AutoModelForCausalLM
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, output_hidden_states=True, torch_dtype=dtype
+        ).to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.device = device
+
+    @torch.no_grad()
+    def encode_layers(self, text: str, num_layers: int) -> torch.Tensor:
+        ids = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=256).to(self.device)
+        out = self.model(**ids)
+        hidden_states = out.hidden_states[1:]  # drop the embedding layer, keep transformer layers
+        eos_reps = [h[:, -1, :].squeeze(0).float().cpu() for h in hidden_states[:num_layers]]
+        if len(eos_reps) < num_layers:
+            # extremely shallow LLM relative to the requested Lr -- pad by
+            # repeating the last layer rather than crashing.
+            eos_reps += [eos_reps[-1]] * (num_layers - len(eos_reps))
+        return torch.stack(eos_reps, dim=0)  # [Lr, Dr]
+
+
+def _build_llm_knowledge(
+    class_names: List[str],
+    descriptions: Dict[str, str],
+    llm_model_path: Optional[str],
+    cache_dir: str,
+    Lr: int,
+    Dr: int,
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    """
+    ADDED. Returns {class_name: Tensor[Lr, Dr]}, using an on-disk cache so
+    the LLM (if available) only ever runs once per class. If no
+    `llm_model_path` is given, falls back to a deterministic
+    pseudo-random placeholder (seeded on the class description) so the
+    rest of the pipeline still runs end-to-end for shape/gradient testing
+    -- but this is NOT real LLM knowledge, and is loudly flagged as such.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    knowledge = {}
+    to_compute = []
+    for name in class_names:
+        safe = name.replace(" ", "_").replace("/", "_")
+        path = os.path.join(cache_dir, f"{safe}_layers.pt")
+        if os.path.exists(path):
+            t = torch.load(path, map_location="cpu")
+            if tuple(t.shape) == (Lr, Dr):
+                knowledge[name] = t
+                continue
+            print(f"Cached LLM knowledge for '{name}' has shape {tuple(t.shape)}, "
+                  f"expected ({Lr},{Dr}) -- recomputing.")
+        to_compute.append(name)
+
+    if not to_compute:
+        return knowledge
+
+    if llm_model_path is None:
+        print(f"WARNING: llm_model_path not provided -- {len(to_compute)} class(es) have no "
+              f"cached LLM knowledge. Using a DETERMINISTIC PSEUDO-RANDOM placeholder "
+              f"(seeded on each class's description text) so the model still runs "
+              f"end-to-end, but this is NOT the paper's LLM-derived knowledge (Eq. 6). "
+              f"Pass llm_model_path=<local LLaMA-3-8B checkpoint dir> to compute the real "
+              f"thing; once cached in {cache_dir}, the LLM never needs to load again.")
+        for name in to_compute:
+            g = torch.Generator().manual_seed(abs(hash(descriptions[name])) % (2 ** 31))
+            t = torch.randn(Lr, Dr, generator=g)
+            torch.save(t, os.path.join(cache_dir, f"{name.replace(' ', '_').replace('/', '_')}_layers.pt"))
+            knowledge[name] = t
+        return knowledge
+
+    print(f"Loading frozen LLM from {llm_model_path} to extract layer-wise knowledge "
+          f"for {len(to_compute)} class(es) (one-time cost; cached afterward to {cache_dir})...")
+    encoder = LLMKnowledgeEncoder(llm_model_path, device=device)
+    for name in to_compute:
+        t = encoder.encode_layers(descriptions[name], num_layers=Lr)
+        if t.shape[-1] != Dr:
+            raise ValueError(
+                f"LLM hidden size is {t.shape[-1]}, but Dr={Dr} was requested. "
+                f"Set Dr={t.shape[-1]} (or pick an LLM whose hidden size matches Dr)."
+            )
+        torch.save(t, os.path.join(cache_dir, f"{name.replace(' ', '_').replace('/', '_')}_layers.pt"))
+        knowledge[name] = t
+    del encoder
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return knowledge
+
+
+class XMLVPPromptLearner(nn.Module):
+
+    def __init__(
+        self,
+        clip_model,
+        class_names: List[str],
+        n_ctx: int = 8,
+        ctx_init: Optional[str] = None,
+        device: str = "cuda",
+        tokenizer_path: str = None,
+        llm_desc_dir: str = "/workdir1.8t/fei27/CGT/GNNMD/BACH/updated_X-MVLP/cache/llm_desc",
+        r: int = 16,
+        # --- ADDED: these are what actually let the module match Eq. 6-11.
+        # All optional with defaults, so existing call sites (that don't
+        # pass them) keep working -- they'll just get the loudly-flagged
+        # placeholder LLM knowledge until you pass llm_model_path.
+        llm_model_path: Optional[str] = None,
+        llm_cache_dir: Optional[str] = None,
+        Dr: int = 4096,       # LLM hidden dim (paper: LLaMA-3-8B -> 4096)
+        Lr: int = 32,         # number of LLM layers kept (paper: 32)
+        L_prefix: int = 4,    # conditional intervention scope (Sec. III-C.3)
+        L_suffix: int = 4,
+        cls_name_len: int = 4,  # tokens reserved for the class-name embedding (Eq. 4's [CLS])
+    ):
+        super().__init__()
+        self.class_names = class_names
+        self.num_classes = len(class_names)
+        self.device = torch.device(device)
+        self.clip_model = clip_model.eval()
+        self.n_ctx = n_ctx
+        self.r = r
+        self.Dr = Dr
+        self.Lr = Lr
+        self.L_prefix = L_prefix
+        self.L_suffix = L_suffix
+        self.cls_name_len = cls_name_len
+
+        # Tokenizer & dimensions
+        if tokenizer_path is None:
+            tokenizer_path = "./biomedclip_local"
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+        self.context_length = getattr(clip_model, "context_length", 77)
+        self.embed_dim = clip_model.text_projection.shape[-1]
+        model_dtype = clip_model.token_embedding.weight.dtype
+        self.D_in = clip_model.token_embedding.embedding_dim
+
+        total_len = Lr + n_ctx + cls_name_len
+        assert total_len <= self.context_length, (
+            f"Prompt length Lr+n_ctx+cls_name_len = {Lr}+{n_ctx}+{cls_name_len} = {total_len} "
+            f"exceeds this CLIP text tower's context_length ({self.context_length}). Reduce Lr "
+            f"(fewer LLM layers kept), n_ctx, or cls_name_len, or use a text tower with a "
+            f"longer context length."
+        )
+        # NOTE: this assertion didn't exist before, and previously wasn't
+        # needed because the prompt was much shorter (16 desc tokens + n_ctx
+        # + 1 cls token). Now that Eq. 6-8 are implemented as written -- one
+        # "token slot" per LLM layer -- prompts are Lr=32 slots longer, so
+        # this is now something that can actually be violated; better to
+        # fail loudly here than get a confusing shape error deep inside
+        # encode_text_from_embs.
+
+        # Load LLM descriptions (unchanged -- still just text, still cached
+        # the same way as before).
+        self.llm_descriptions = load_llm_class_descriptions(class_names, llm_desc_dir)
+
+        # FIXED (this replaces the entire old `self.desc_embs` block): the
+        # original embedded each class's description text using *CLIP's own
+        # tokenizer/token_embedding* -- i.e. no LLM was ever involved, and
+        # r_y^l (Eq. 6, meant to be a frozen LLM's per-layer hidden states,
+        # Dr=4096-dim, Lr=32 of them) didn't exist anywhere in this file.
+        # This builds the real thing: {class_name: Tensor[Lr, Dr]}, either
+        # from a real frozen LLM (if llm_model_path is given) or a clearly
+        # -flagged placeholder otherwise (see _build_llm_knowledge).
+        llm_cache_dir = llm_cache_dir or os.path.join(llm_desc_dir, "llm_layers")
+        knowledge = _build_llm_knowledge(
+            class_names, self.llm_descriptions, llm_model_path, llm_cache_dir, Lr, Dr, device
+        )
+        knowledge_stack = torch.stack([knowledge[c] for c in class_names], dim=0)  # [C, Lr, Dr]
+        self.register_buffer("llm_knowledge", knowledge_stack.to(self.device))
+        # `register_buffer` (not nn.Parameter) -- this is frozen LLM output,
+        # never trained, and correctly excluded from .parameters() / the
+        # optimizer without needing requires_grad=False bookkeeping.
+
+        # FIXED: Eq. (7)'s projector K in R^{r x Dr}, Q in R^{Dp x r} is
+        # *shared across classes* in the paper -- no per-class index. The
+        # original had per-class self.A[C,r,D_in]/self.B[C,embed_dim,r]
+        # (more parameters, and see the embed_dim bug below). Replaced with
+        # a single shared (K_proj, Q_proj) pair, applied identically to
+        # every class's per-layer representations.
+        #
+        # FIXED (dimension bug): output dim is now D_in, not embed_dim.
+        # D_in is CLIP's *token-embedding / transformer-input* space, where
+        # self.ctx and the class-name tokens below both live, and where
+        # encode_text_from_embs expects its input before it applies
+        # positional embeddings and runs the transformer. embed_dim (the
+        # *final*, post text_projection output dim) is only produced at the
+        # very end of encode_text_from_embs. The original projector
+        # produced h_tilde in embed_dim space, then concatenated it with
+        # ctx/cls tokens that are in D_in space along the sequence
+        # dimension -- which requires the feature (last) dimension to
+        # already match. If embed_dim != D_in for your checkpoint (true for
+        # most PubMedBERT-based BiomedCLIP variants), that concatenation
+        # should raise a shape-mismatch RuntimeError; if it happened to run
+        # for you, your specific checkpoint's embed_dim and D_in likely
+        # coincide, which isn't something to rely on in general.
+        self.K_proj = nn.Parameter(torch.empty(r, Dr))
+        self.Q_proj = nn.Parameter(torch.empty(self.D_in, r))
+        nn.init.kaiming_uniform_(self.K_proj, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.Q_proj, a=math.sqrt(5))
+
+        # Learnable context (Eq. 4's [V]_1..[V]_L) -- unchanged.
+        if ctx_init:
+            init_ids = self.tokenizer(ctx_init, add_special_tokens=False, return_tensors="pt").input_ids[0].to(self.device)
+            with torch.no_grad():
+                init_embs = clip_model.token_embedding(init_ids).to(dtype=model_dtype)
+            if len(init_embs) >= n_ctx:
+                ctx_embs = init_embs[:n_ctx]
+            else:
+                pad = init_embs[-1:].repeat(n_ctx - len(init_embs), 1)
+                ctx_embs = torch.cat([init_embs, pad], dim=0)
+            self.ctx = nn.Parameter(ctx_embs)
+        else:
+            self.ctx = nn.Parameter(torch.randn(n_ctx, self.D_in, device=self.device, dtype=model_dtype) * 0.02)
+
+        # FIXED: Eq. (4) says [CLS] "embeds the class name (e.g.
+        # 'pneumonia')" -- the original used
+        # `self.tokenizer.cls_token_id`, the *same generic special token for
+        # every class*, so class identity never actually entered the prompt
+        # as a class-name embedding; it only entered indirectly through the
+        # per-class LLM description + per-class LoRA. This embeds each
+        # class's actual display name (e.g. "melanoma") once, up front, and
+        # caches it as a frozen buffer -- exactly analogous to how the old
+        # code cached `self.desc_embs`, just for the (much shorter)
+        # class-name string instead of the full description, and matching
+        # Eq. (4) literally instead of approximately.
+        cls_embs = []
+        with torch.no_grad():
+            for name in class_names:
+                ids = self.tokenizer(name, add_special_tokens=False, return_tensors="pt").input_ids[0].to(self.device)
+                embs = clip_model.token_embedding(ids).to(dtype=model_dtype)
+                if embs.size(0) < cls_name_len:
+                    pad = embs[-1:].expand(cls_name_len - embs.size(0), -1)
+                    embs = torch.cat([embs, pad], dim=0)
+                else:
+                    embs = embs[:cls_name_len]
+                cls_embs.append(embs)
+        self.register_buffer("cls_name_embs", torch.stack(cls_embs, dim=0))  # [C, cls_name_len, D_in]
+
+        # FIXED: Eq. (9) defines W_z as *purely* low-rank: W_z = Q_z K_z,
+        # nothing else. The original wrapped this in `LoRALinear`, which
+        # adds a fixed, randomly-initialized *dense* embed_dim x Dr matrix
+        # (frozen, but still a full-rank linear map, not part of Eq. 9) on
+        # top of the trainable low-rank delta -- a reasonable pattern for
+        # adapting a real pretrained layer, but there's no pretrained W_z
+        # here to adapt, so it was adding an extra fixed random projection
+        # that Eq. 9 doesn't call for. Also fixed: the original hardcoded
+        # `r=8` here regardless of the `r` argument (e.g. r=16 in your
+        # training script), a silent rank mismatch against the projector
+        # above. Both fixed by implementing Q_z/K_z directly with the same
+        # `r` as everything else.
+        self.Q_z = nn.Parameter(torch.empty(Dr, r))
+        self.K_z = nn.Parameter(torch.empty(r, self.embed_dim))
+        nn.init.kaiming_uniform_(self.Q_z, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.K_z, a=math.sqrt(5))
+
+        # Eq. (11): R in R^{r x Dr}, W_t in R^{r x 2Dr}, b_t in R^r.
+        self.R_int = nn.Parameter(torch.empty(r, Dr))
+        nn.init.kaiming_uniform_(self.R_int, a=math.sqrt(5))
+        self.W_t = nn.Linear(Dr * 2, r)
+        self.b_t = nn.Parameter(torch.zeros(r))
+
+        self.clip_model.eval()
+
+    def forward(self, images: torch.Tensor):
+        B = images.shape[0]
+        C = self.num_classes
+
+        with torch.no_grad():
+            patch_feats = forward_vision_features(self.clip_model.visual, images)  # [B, L, D_vision]
+            image_features = self.clip_model.encode_image(images).float()  # [B, embed_dim]
+        image_features = _l2norm(image_features, dim=-1)
+        z = image_features  # [B, embed_dim]
+
+        # Eq. (9): z_tilde = W_z z = Q_z K_z z, projected up into LLM space.
+        z_tilde = (z @ self.K_z.t()) @ self.Q_z.t()  # [B, Dr]
+
+        # Frozen per-class, per-layer LLM knowledge (Eq. 6), broadcast over
+        # the batch -- this doesn't require_grad and isn't in the optimizer;
+        # only the adapters that touch it below are trainable.
+        r_y = self.llm_knowledge.unsqueeze(0).expand(B, -1, -1, -1)  # [B, C, Lr, Dr]
+
+        # Sec. III-C.3: intervene only on prefix/suffix layers, leave
+        # mid-layers as pure frozen LLM representations.
+        intervene_idx = torch.cat([
+            torch.arange(0, self.L_prefix, device=self.device),
+            torch.arange(self.Lr - self.L_suffix, self.Lr, device=self.device),
+        ]).unique()
+
+        r_y_adapted = r_y
+        if len(intervene_idx) > 0:
+            r_sel = r_y[:, :, intervene_idx, :]  # [B, C, S, Dr]
+            z_exp = z_tilde.view(B, 1, 1, self.Dr).expand(-1, C, r_sel.shape[2], -1)  # [B, C, S, Dr]
+
+            # Eq. (10): t_y^l = concat[r_y^l, r_y^l ⊙ z_tilde]
+            t = torch.cat([r_sel, r_sel * z_exp], dim=-1)  # [B, C, S, 2*Dr]
+
+            # Eq. (11): G_phi(r_y^l, z) = r_y^l + R^T( W_t t + b_t - R r_y^l )
+            # FIXED: the original computed `W_t(t) + b_t` and stopped there
+            # -- the `- R r_y^l` term inside the parentheses was missing
+            # entirely (R was only ever used as R^T on the outside, never
+            # applied to r_y^l on its own). Both terms are present below.
+            Rr = torch.einsum('rd,bcsd->bcsr', self.R_int, r_sel)      # R r_y^l        [B,C,S,r]
+            inner = self.W_t(t) + self.b_t - Rr                        # bracket term    [B,C,S,r]
+            delta = torch.einsum('bcsr,rd->bcsd', inner, self.R_int)   # R^T( ... )      [B,C,S,Dr]
+
+            r_adapted_sel = r_sel + delta  # Eq. 11
+            r_y_adapted = r_y.clone()
+            r_y_adapted[:, :, intervene_idx, :] = r_adapted_sel
+
+        # Eq. (7): shared low-rank projector, applied to every layer
+        # (intervened or not) -- r_tilde_y in R^{Lr x D_in} per class.
+        r_tilde = torch.einsum('rd,bcld->bclr', self.K_proj, r_y_adapted)  # [B, C, Lr, r]
+        r_tilde = torch.einsum('pr,bclr->bclp', self.Q_proj, r_tilde)      # [B, C, Lr, D_in]
+
+        # Eq. (8): concat[r_tilde_y, p_y_base]. The class-name tokens play
+        # the role of Eq. (4)'s [CLS] (see the fix in __init__).
+        ctx_exp = self.ctx.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)          # [B, C, n_ctx, D_in]
+        cls_exp = self.cls_name_embs.unsqueeze(0).expand(B, -1, -1, -1)            # [B, C, cls_name_len, D_in]
+        prompt_embs = torch.cat([r_tilde, ctx_exp, cls_exp], dim=2)                # [B, C, Lr+n_ctx+cls_len, D_in]
+
+        # IMPROVED (this is the main slowdown fix): the original encoded
+        # text with a nested `for b in range(B): for c in range(C):` loop
+        # calling encode_text_from_embs ONE (b,c) pair at a time -- i.e.
+        # B*C sequential text-encoder forward passes per step (e.g. 32*7 =
+        # 224 separate CLIP-text-tower calls every training step), each on a
+        # batch of size 1, which massively underuses the GPU. Since
+        # encode_text_from_embs already accepts an arbitrary leading batch
+        # dimension [N, L, D], all B*C prompts can be flattened into a
+        # single [B*C, L, D] batch and encoded in ONE call, then reshaped
+        # back to [B, C, embed_dim]. Mathematically identical output, but
+        # one big batched matmul through the transformer instead of 224
+        # tiny ones -- this is where most of your 12h-for-36-epochs is going.
+        L_prompt = prompt_embs.shape[2]
+        flat_prompts = prompt_embs.reshape(B * C, L_prompt, self.D_in)  # [B*C, L, D_in]
+        flat_feats = self.clip_model.encode_text_from_embs(flat_prompts)  # [B*C, embed_dim]
+        text_features = flat_feats.reshape(B, C, -1)  # [B, C, embed_dim]
+        text_features = _l2norm(text_features, dim=-1)
+
+        logit_scale = self.clip_model.logit_scale.exp().float()
+        logits = logit_scale * torch.einsum('b c d, b d -> b c', text_features, image_features)
+
+        cache = {
+            'image_features': image_features,        # [B, embed_dim]  ← pooled
+            'patch_features': patch_feats,            # [B, L, D_vision] ← unpooled, for XAI
+            'text_features': text_features,
+            'prompt_embs': prompt_embs,
+            'llm_descriptions': self.llm_descriptions,
+            'r_tilde': r_tilde,
+        }
+
+        return logits, cache
+
+
+def encode_text_from_embs(self, embs, attention_mask=None):
+    """
+    Forward pass from embeddings (no token lookup).
+    embs: [B, L] (input_ids) or [B, L, D] (precomputed embeddings)
+    attention_mask: [B, L] (optional)
+    Returns: [B, D_proj]
+    """
+    if embs.dim() == 2 and embs.dtype == torch.long:
+        # Input is token IDs → embed
+        x = self.token_embedding(embs)  # [B, L, D]
+    elif embs.dim() == 3:
+        # Input is precomputed embeddings
+        x = embs
+    else:
+        raise ValueError(f"Invalid input shape: {embs.shape}")
+
+    # Add positional embedding
+    pos_emb = self.positional_embedding[:x.shape[1], :].unsqueeze(0)  # [1, L, D]
+    x = x + pos_emb
+
+    # Apply attention mask (if provided)
+    if attention_mask is not None:
+        # Zero out masked positions
+        x = x * attention_mask.unsqueeze(-1)
+
+    # Transformer expects [L, B, D]
+    x = x.permute(1, 0, 2)
+    x = self.transformer(x)
+    x = x.permute(1, 0, 2)  # [B, L, D]
+
+    x = self.ln_final(x)
+
+    # Use last non-masked token if mask available; otherwise last token
+    if attention_mask is not None:
+        # Find last non-zero index per row
+        lengths = attention_mask.sum(dim=1) - 1  # Subtract 1 for 0-indexing
+        idx = lengths.long().unsqueeze(1).unsqueeze(2).expand(-1, 1, x.size(-1))
+        x = x.gather(1, idx).squeeze(1)  # [B, D]
+    else:
+        x = x[torch.arange(x.shape[0]), -1]  # Last token
+
+    # Project
+    if hasattr(self, 'text_projection'):
+        if isinstance(self.text_projection, torch.Tensor):
+            x = x @ self.text_projection
+        else:
+            x = self.text_projection(x)
+
+    return x
